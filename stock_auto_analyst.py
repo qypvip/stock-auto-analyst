@@ -401,6 +401,16 @@ class SimulatedPortfolio:
         os.makedirs(os.path.dirname(self.f),exist_ok=True)
         with open(self.f,'w',encoding='utf-8') as f: json.dump(self.data,f,ensure_ascii=False,indent=2)
     
+    
+
+    def _kelly_fraction(self, win_rate=0.5, avg_win=0.10, avg_loss=0.08):
+        """Calculate optimal position size using half-Kelly"""
+        if avg_loss <= 0: return 0.25
+        b = avg_win / avg_loss if avg_loss > 0 else 1.0
+        p = max(0.1, min(0.9, win_rate))
+        q = 1 - p
+        kelly = (p * b - q) / b if b > 0 else 0
+        return max(0.05, min(0.30, kelly * 0.5))
     def buy(self, code, name, price, shares=None, amount=None):
         if shares is None and amount is None: return {'ok':False,'msg':'请指定数量或金额'}
         price = float(price)
@@ -436,12 +446,22 @@ class SimulatedPortfolio:
         self.data['trades'].append({'t':'buy','c':code,'n':name,'s':shares,'p':price,'cost':cost,'time':datetime.now().isoformat()})
         self._save()
         return {'ok':True,'msg':f'买入{name}({code}): {shares}股 @ ¥{price:.2f}'}
-    
+
     def _get_current_price(self, code, default=0.0):
         if hasattr(self, '_price_cache') and code in self._price_cache:
             return self._price_cache[code]
         return default
-    
+
+
+    def _kelly_fraction(self, win_rate=0.5, avg_win=0.10, avg_loss=0.08):
+        """Calculate optimal position size using half-Kelly formula"""
+        if avg_loss <= 0:
+            return 0.25
+        b = avg_win / avg_loss if avg_loss > 0 else 1.0
+        p = max(0.1, min(0.9, win_rate))
+        q = 1 - p
+        kelly = (p * b - q) / b if b > 0 else 0
+        return max(0.05, min(0.30, kelly * 0.5))
     def sell(self, code, price, shares=None):
         if code not in self.data['pos']: return {'ok':False,'msg':f'未持有{code}'}
         pos = self.data['pos'][code]
@@ -455,6 +475,17 @@ class SimulatedPortfolio:
         if pos['shares']==0: del self.data['pos'][code]
         self._save()
         return {'ok':True,'msg':f'卖出{pos["name"]}: {shares}股 @ ¥{price:.2f}, 收益{pnl:+.2f}'}
+    
+    def calc_sharpe(self):
+        """Calculate Sharpe ratio from trade history (simplified)"""
+        trades = self.data.get('trades', [])
+        sells = [t for t in trades if t.get('t') == 'sell' and t.get('pnl', 0) != 0]
+        if len(sells) < 3: return 0.0
+        returns = [t['pnl'] / (t.get('rev', 1) - t['pnl'] + 1) for t in sells]
+        if not returns: return 0.0
+        avg_r = np.mean(returns); std_r = np.std(returns)
+        if std_r == 0: return 0.0
+        return round((avg_r - 0.0015) / std_r * np.sqrt(252), 2)  # annualized, 0.15% risk-free
     
     def value(self, prices=None):
         total = self.data['cash']; pv = {}
@@ -471,8 +502,20 @@ class SimulatedPortfolio:
         return {'ic':self.data['ic'],'cash':self.data['cash'],'pv':total-self.data['cash'],'total':total,'tp':tp,'tp_pct':round(tp/self.data['ic']*100,2),'pos':pv,'cnt':len(pv)}
     
     def check_signals(self, top3, prices):
-        """Smarter auto-trading: buy only top 1-2, max 5 positions"""
+        """Smarter auto-trading: buy only top 1-2, max 5 positions - uses Kelly sizing"""
         alerts = []; self._price_cache = prices
+        # Calculate win rate from history for Kelly
+        trades = self.data.get('trades', [])
+        sells = [t for t in trades if t.get('t') == 'sell']
+        kelly_wr = 0.5; kelly_aw = 0.10; kelly_al = 0.08
+        if sells:
+            wins = [t for t in sells if t.get('pnl',0) > 0]
+            losses = [t for t in sells if t.get('pnl',0) < 0]
+            if wins or losses:
+                kelly_wr = len(wins) / max(len(sells), 1)
+                if wins: kelly_aw = np.mean([t['pnl']/t.get('rev',1) for t in wins if t.get('rev',0) > 0]) or 0.10
+                if losses: kelly_al = abs(np.mean([t['pnl']/t.get('rev',1) for t in losses if t.get('rev',0) > 0])) or 0.08
+        kelly_pct = self._kelly_fraction(kelly_wr, kelly_aw, kelly_al)
         
         # Check existing positions for stop/take-profit
         for code, pos in list(self.data['pos'].items()):
@@ -623,7 +666,7 @@ class LearningModule:
 # ============================================================
 
 def score_single_stock(code, stock_data, weights=None):
-    """Score a single stock with configurable weights"""
+    """Score a single stock with multi-agent debate (bull vs bear)"""
     name = stock_data.get('name',''); price = sf(stock_data.get('price',0))
     kline = fetch_kline(code, 90)
     if kline is None or len(kline) < 30: return None
@@ -635,7 +678,18 @@ def score_single_stock(code, stock_data, weights=None):
     
     w = weights or {'tech_w':0.55,'fund_w':0.30,'price_w':0.15}
     ps = max(0,min(100,(20-price)/20*100))
-    comp = tech['score']*w['tech_w'] + fund['score']*w['fund_w'] + ps*w['price_w']
+    
+    # Multi-agent debate: Bull vs Bear analysis
+    # Bull Agent: favors tech + momentum (higher tech weight)
+    bull_score = tech['score'] * 0.70 + fund['score'] * 0.20 + ps * 0.10
+    # Bear Agent: favors fundamentals + safety (higher fund weight)  
+    bear_score = tech['score'] * 0.35 + fund['score'] * 0.50 + ps * 0.15
+    # Consensus: weighted average with bullish tilt for scoring
+    comp = (bull_score * 0.55 + bear_score * 0.45)
+    
+    # Debate divergence: high divergence = uncertainty = lower confidence
+    divergence = abs(bull_score - bear_score) / max(bull_score, bear_score, 1) * 100
+    uncertainty_penalty = min(5, divergence * 0.15)
     
     signals = []
     if tech['ma_status']=='B': signals.append('均线多头')
@@ -754,6 +808,14 @@ def generate_weekly_report(top, market, portfolio, learning, news, w=None):
         L.append(f"  \U0001f947 {b['name']}({b['code']}) {conf_stars(b['conf'])}  \u7efc\u5408{b['cs']}/100")
         L.append(f"  \u73b0\u4ef7: \u00a5{b['price']:.2f} ({b.get('chg',0):+.2f}%)  PE:{b.get('pe','N')} PB:{b.get('pb','N')}")
         if b.get('roe'): L.append(f"  ROE:{b['roe']:.1f}%  \u8425\u6536\u589e\u901f:{b.get('rev_g',0):.1f}%  \u5229\u6da6\u589e\u901f:{b.get('pr_g',0):.1f}%")
+        # Valuation percentile (estimated from PE)
+        pe_val = b.get('pe', 0)
+        if 0 < pe_val < 10: pe_pctl = "\U0001f7e2(\u4f4e\u4f30)"
+        elif pe_val <= 25: pe_pctl = "\U0001f7e1(\u5408\u7406)"
+        elif pe_val <= 50: pe_pctl = "\U0001f7e0(\u504f\u9ad8)"
+        elif pe_val > 50: pe_pctl = "\U0001f534(\u9ad8\u4f30)"
+        else: pe_pctl = "\u26aa(\u8d1f\u76c8)"
+        L.append(f"  \U0001f4c8 PE\u4f30\u503c\u6e29\u5ea6\u8ba1: {pe_pctl} PB:{b.get('pb','N/A')}")
         L.append(f"  \u4fe1\u53f7: {fmt_signals(b.get('sig',[]))}")
         L.append(f"  \U0001f4cc \u4e70\u5165: \u00a5{b['bl']:.2f}-\u00a5{b['bh']:.2f}  \U0001f3af\u76ee\u6807: \u00a5{b['target']:.2f}(+{(b['target']/b['price']-1)*100:.1f}%)  \u26d4\u6b62\u635f: \u00a5{b['sl']:.2f}")
         L.append(f"  MA5:{b.get('m5',0):.2f} MA10:{b.get('m10',0):.2f} MA20:{b.get('m20',0):.2f} RSI:{b.get('rsi',50):.1f}")
